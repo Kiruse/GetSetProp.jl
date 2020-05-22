@@ -50,12 +50,12 @@ macro generate_properties(T, block)
     
     # Generate Getters
     fnexpr = :(function Base.getproperty(self::$T, prop::Symbol) end)
-    generate_branches(fnexpr, ((prop, (linenumber, getter)) for (prop, ((linenumber, getter), _)) ∈ props), :(getfield(self, prop)))
+    generate_branches(fnexpr, ((prop, getter) for (prop, (getter, _)) ∈ props), :(getfield(self, prop)))
     push!(block.args, fnexpr) # Attach to returned code
     
     # Generate Setters
     fnexpr = :(function Base.setproperty!(self::$T, prop::Symbol, value) end)
-    generate_branches(fnexpr, ((prop, (linenumber, setter)) for (prop, (_, (linenumber, setter))) ∈ props), :(setfield!(self, prop, value)))
+    generate_branches(fnexpr, ((prop, setter) for (prop, (_, setter)) ∈ props), :(setfield!(self, prop, value)))
     push!(block.args, fnexpr) # Attach to returned code
     
     esc(block)
@@ -89,26 +89,35 @@ function generate_branches(fnexpr::Expr, props, elsebranch)
     firstbranchexpr = nothing
     lastbranchexpr  = nothing
     
-    for (prop, (linenumber, body)) ∈ props
-        comparison = Expr(:call, :(==), :prop, Expr(:call, :Symbol, string(prop)))
-        if linenumber === nothing
-            subblock = body
-        else
-            subblock = Expr(:block, linenumber, body)
+    for (prop, fn) ∈ props
+        if fn !== nothing
+            linenumber, body = fn
+            
+            comparison = Expr(:call, :(==), :prop, Expr(:call, :Symbol, string(prop)))
+            if linenumber === nothing
+                subblock = body
+            else
+                subblock = Expr(:block, linenumber, body)
+            end
+            branchexpr = Expr(:elseif, comparison, subblock)
+            
+            if lastbranchexpr === nothing
+                firstbranchexpr = branchexpr
+                branchexpr.head = :if
+            else
+                push!(lastbranchexpr.args, branchexpr)
+            end
+            lastbranchexpr = branchexpr
         end
-        branchexpr = Expr(:elseif, comparison, subblock)
-        
-        if lastbranchexpr === nothing
-            firstbranchexpr = branchexpr
-            branchexpr.head = :if
-        else
-            push!(lastbranchexpr.args, branchexpr)
-        end
-        lastbranchexpr = branchexpr
     end
     
-    push!(fnexpr.args[2].args, firstbranchexpr)         # Attach if-elseif-else branches to function body
-    push!(lastbranchexpr.args, elsebranch) # Final else branch
+    if firstbranchexpr !== nothing
+        push!(fnexpr.args[2].args, firstbranchexpr) # Attach if-elseif-else branches to function body
+        push!(lastbranchexpr.args, elsebranch) # Final else branch
+    else
+        # Fallback if no getters/setters available
+        push!(fnexpr.args[2].args, elsebranch)
+    end
     fnexpr
 end
 
