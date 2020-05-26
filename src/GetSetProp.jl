@@ -71,7 +71,7 @@ function replace_self(expr::Expr)
     if expr.head == :(=)
         lhs, rhs = expr.args
         
-        if isa(expr.args[1], Expr) && expr.args[1].head == :.
+        if isa(lhs, Expr) && lhs.head == :. && lhs.args[1] == :self
             prop = lhs.args[2]
             expr = :(setfield!(self, $prop, $rhs))
         end

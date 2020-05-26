@@ -4,20 +4,26 @@ using .GetSetProp
 
 updater() = println("Updated! :D")
 
+mutable struct Size
+    width::Int
+    height::Int
+end
+Size() = Size(0, 0)
+
 mutable struct Foo
-    size::NTuple{2, Int}
+    size::Size
     padding::NTuple{4, Int}
     dirty::Bool
     update
 end
-Foo() = Foo((0, 0), (0, 0, 0, 0), false, updater)
+Foo() = Foo(Size(0, 0), (0, 0, 0, 0), false, updater)
 
 @generate_properties Foo begin
-    @get width = self.size[1]
-    @set width = self.size = (value, self.size[2])
+    @get width = self.size.width
+    @set width = self.size.width = value
     
-    @get height = self.size[2]
-    @set height = (self.dirty = true; self.size = (self.size[1], value))
+    @get height = self.size.height
+    @set height = (self.dirty = true; self.size.height = value)
     
     @get padding = self.padding
     @set padding = self.padding = begin
@@ -37,4 +43,6 @@ Foo() = Foo((0, 0), (0, 0, 0, 0), false, updater)
     end
 end
 
-foo = Foo((1, 2), (3, 4, 5, 6), true, updater)
+foo = Foo(Size(1, 2), (3, 4, 5, 6), true, updater)
+foo.width = 2
+println(foo.size.height)
