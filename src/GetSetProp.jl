@@ -5,6 +5,18 @@ export @generate_properties, @get, @set
 const Optional{T} = Union{T, Nothing}
 const GetterSetterBody = Tuple{Optional{LineNumberNode}, Expr}
 
+struct StructField{S, F} end
+assign(inst, field::Symbol, value) = assign(getfieldtype(typeof(inst), field), inst, field, value)
+assign(T::Type, inst, field::Symbol, value) = setfield!(inst, field, convert(T, value))
+assign(::Type{T1}, inst, field::Symbol, value::T2) where {T1, T2<:T1} = setfield!(inst, field, value)
+assign(::Type{T1}, inst, field::Symbol, value::T2) where {T1<:Number, T2<:Number} = setfield!(inst, field, T1(value))
+
+getfieldtype(S::Type, F::Symbol) = getfieldtype(StructField{S, F})
+@generated function getfieldtype(::Type{StructField{S, F}}) where {S, F}
+    T = S.types[findfirst(field->field==F, fieldnames(S))]
+    :($T)
+end
+
 macro generate_properties(T, block)
     if !isa(block, Expr) || block.head != :block
         throw(ArgumentError("Second argument to @generate_properties must be a block"))
@@ -55,10 +67,7 @@ macro generate_properties(T, block)
     
     # Generate Setters
     fnexpr = :(function Base.setproperty!(self::$T, prop::Symbol, value) end)
-    generate_branches(fnexpr, ((prop, setter) for (prop, (_, setter)) ∈ props), quote
-        T = typeof(getfield(self, prop))
-        setfield!(self, prop, convert(T, value))
-    end)
+    generate_branches(fnexpr, ((prop, setter) for (prop, (_, setter)) ∈ props), :(GetSetProp.assign(self, prop, value)))
     push!(block.args, fnexpr) # Attach to returned code
     
     esc(block)

@@ -3,12 +3,16 @@ include("./src/GetSetProp.jl")
 using StaticArrays
 using .GetSetProp
 
-updater() = println("Updated! :D")
+abstract type SuperType end
+
+struct Subtype1 <: SuperType end
+struct Subtype2 <: SuperType end
 
 mutable struct Foo
-    size::SVector{2, Float64}
+    size::Vector{Float64}
+    bar::SuperType
 end
-Foo() = Foo(SVector(0, 0))
+Foo() = Foo([0, 0], Subtype1())
 
 @generate_properties Foo begin
     @get width = self.size[1]
@@ -20,6 +24,8 @@ end
 
 foo = Foo()
 (function()
-    @time foo.size = SVector(2, 4)
-    @time foo.size = SVector(2, 4)
+    @time Foo.types[findfirst(field->field==:bar, fieldnames(Foo))]
+    @time Foo.types[findfirst(field->field==:bar, fieldnames(Foo))]
+    @time GetSetProp.getfieldtype(Foo, :bar)
+    @time GetSetProp.getfieldtype(Foo, :bar)
 end)()
