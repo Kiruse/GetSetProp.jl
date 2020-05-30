@@ -55,7 +55,10 @@ macro generate_properties(T, block)
     
     # Generate Setters
     fnexpr = :(function Base.setproperty!(self::$T, prop::Symbol, value) end)
-    generate_branches(fnexpr, ((prop, setter) for (prop, (_, setter)) ∈ props), :(setfield!(self, prop, value)))
+    generate_branches(fnexpr, ((prop, setter) for (prop, (_, setter)) ∈ props), quote
+        T = typeof(getfield(self, prop))
+        setfield!(self, prop, convert(T, value))
+    end)
     push!(block.args, fnexpr) # Attach to returned code
     
     esc(block)
