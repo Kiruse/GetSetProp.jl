@@ -1,3 +1,8 @@
+######################################################################
+# GetSetProp
+# ----------
+# Provides macros to generate getters and setters for virtual properties.
+
 module GetSetProp
 
 export @generate_properties, @get, @set
@@ -5,11 +10,19 @@ export @generate_properties, @get, @set
 const Optional{T} = Union{T, Nothing}
 const GetterSetterBody = Tuple{Optional{LineNumberNode}, Expr}
 
+struct StructProp{S, F} end
 struct StructField{S, F} end
+
 assign(inst, field::Symbol, value) = assign(getfieldtype(typeof(inst), field), inst, field, value)
-assign(T::Type, inst, field::Symbol, value) = setfield!(inst, field, convert(T, value))
-assign(::Type{T1}, inst, field::Symbol, value::T2) where {T1, T2<:T1} = setfield!(inst, field, value)
+assign(T::Type{StructProp{ S, F}}, inst::S, value) where {S, F} = assign(StructField{S, F}, inst, value)
+assign(T::Type{StructField{S, F}}, inst::S, value) where {S, F} = assign(getfieldtype(T), inst, F, value)
+assign(T::Type, inst, field::Symbol, value)                                       = setfield!(inst, field, convert(T, value))
+assign(::Type{T1}, inst, field::Symbol, value::T2) where {T1, T2<:T1}             = setfield!(inst, field, value)
 assign(::Type{T1}, inst, field::Symbol, value::T2) where {T1<:Number, T2<:Number} = setfield!(inst, field, T1(value))
+
+retrieve(inst, field::Symbol) = retrieve(StructField{typeof(inst), field}, inst)
+retrieve(::Type{StructProp{ S, F}}, inst::S) where {S, F} = retrieve(StructField{S, F}, inst)
+retrieve(::Type{StructField{S, F}}, inst::S) where {S, F} = getfield(inst, F)
 
 getfieldtype(S::Type, F::Symbol) = getfieldtype(StructField{S, F})
 @generated function getfieldtype(::Type{StructField{S, F}}) where {S, F}
@@ -22,7 +35,8 @@ macro generate_properties(T, block)
         throw(ArgumentError("Second argument to @generate_properties must be a block"))
     end
     
-    props  = Dict{Symbol, NTuple{2, Optional{GetterSetterBody}}}()
+    result = Expr(:block)
+    props  = Set{Symbol}()
     symget = Symbol("@get")
     symset = Symbol("@set")
     symeq  = Symbol("=")
@@ -39,38 +53,31 @@ macro generate_properties(T, block)
             args = filterlinenumbers(expr.args)
             if args[2].head != symeq throw(ArgumentError("Getter/Setter not an assignment")) end
             prop, body = filterlinenumbers(args[2].args)
-            body = replace_self(body)
-            
-            if !haskey(props, prop)
-                props[prop] = (nothing, nothing)
-            end
+            body = replace_self(T, body)
+            push!(props, prop)
             
             if expr.args[1] == symget
-                props[prop] = ((lastlinenumber, body), props[prop][2])
+                push!(result.args, generate_getter(T, prop, lastlinenumber, body))
             elseif expr.args[1] == symset
-                props[prop] = (props[prop][1], (lastlinenumber, body))
+                push!(result.args, generate_setter(T, prop, lastlinenumber, body))
             end
             
             lastlinenumber = nothing
         end
     end
     
-    block = Expr(:block)
+    # Generate propertynames
+    push!(result.args, quote
+        @generated function Base.propertynames(::$T)
+            res = tuple(union($props, fieldnames($T))...)
+            :($res)
+        end
+    end)
     
-    propsymbols = Set(keys(props))
-    push!(block.args, :(@generated Base.propertynames(::$T) = tuple(union($propsymbols, fieldnames($T))...)))
+    push!(result.args, :(Base.getproperty(self::$T, prop::Symbol) = GetSetProp.retrieve(GetSetProp.StructProp{$T, prop}, self)))
+    push!(result.args, :(Base.setproperty!(self::$T, prop::Symbol, value) = GetSetProp.assign(GetSetProp.StructProp{$T, prop}, self, value)))
     
-    # Generate Getters
-    fnexpr = :(function Base.getproperty(self::$T, prop::Symbol) end)
-    generate_branches(fnexpr, ((prop, getter) for (prop, (getter, _)) ∈ props), :(getfield(self, prop)))
-    push!(block.args, fnexpr) # Attach to returned code
-    
-    # Generate Setters
-    fnexpr = :(function Base.setproperty!(self::$T, prop::Symbol, value) end)
-    generate_branches(fnexpr, ((prop, setter) for (prop, (_, setter)) ∈ props), :(GetSetProp.assign(self, prop, value)))
-    push!(block.args, fnexpr) # Attach to returned code
-    
-    esc(block)
+    esc(result)
 end
 
 macro get(args...) end
@@ -78,59 +85,54 @@ macro set(args...) end
 
 filterlinenumbers(exprs) = filter(expr->!isa(expr, LineNumberNode), exprs)
 
-replace_self(expr) = expr
-function replace_self(expr::Expr)
+replace_self(T::Symbol, expr) = expr
+function replace_self(T::Symbol, expr::Expr)
     if expr.head == :(=)
         lhs, rhs = expr.args
         
         if isa(lhs, Expr) && lhs.head == :. && lhs.args[1] == :self
-            prop = lhs.args[2]
-            expr = :(setfield!(self, $prop, $rhs))
+            prop = lhs.args[2]::QuoteNode
+            expr = :(GetSetProp.assign(self, $rhs))
+            insert!(expr.args, 2, structfieldexpr(T, prop))
         end
     elseif expr.head == :.
         if expr.args[1] == :self
-            prop = expr.args[2]
-            expr = :(getfield(self, $prop))
+            prop = expr.args[2]::QuoteNode
+            expr = :(GetSetProp.retrieve(self))
+            insert!(expr.args, 2, structfieldexpr(T, prop))
         end
     end
-    expr.args = map(replace_self, expr.args)
+    expr.args = map(sub->replace_self(T, sub), expr.args)
     expr
 end
 
-function generate_branches(fnexpr::Expr, props, elsebranch)
-    firstbranchexpr = nothing
-    lastbranchexpr  = nothing
+function generate_getter(T::Symbol, prop::Symbol, linenumber::Optional{LineNumberNode}, body)
+    block = Expr(:block)
+    if linenumber !== nothing push!(block.args, linenumber) end
+    push!(block.args, body)
     
-    for (prop, fn) ∈ props
-        if fn !== nothing
-            linenumber, body = fn
-            
-            comparison = Expr(:call, :(==), :prop, Expr(:call, :Symbol, string(prop)))
-            if linenumber === nothing
-                subblock = body
-            else
-                subblock = Expr(:block, linenumber, body)
-            end
-            branchexpr = Expr(:elseif, comparison, subblock)
-            
-            if lastbranchexpr === nothing
-                firstbranchexpr = branchexpr
-                branchexpr.head = :if
-            else
-                push!(lastbranchexpr.args, branchexpr)
-            end
-            lastbranchexpr = branchexpr
-        end
-    end
-    
-    if firstbranchexpr !== nothing
-        push!(fnexpr.args[2].args, firstbranchexpr) # Attach if-elseif-else branches to function body
-        push!(lastbranchexpr.args, elsebranch) # Final else branch
-    else
-        # Fallback if no getters/setters available
-        push!(fnexpr.args[2].args, elsebranch)
-    end
+    fnexpr = :(GetSetProp.retrieve(self::$T) = $block)
+    insert!(fnexpr.args[1].args, 2, argtypeexpr(structpropexpr(T, prop)))
     fnexpr
+end
+
+function generate_setter(T::Symbol, prop::Symbol, linenumber::Optional{LineNumberNode}, body)
+    block = Expr(:block)
+    if linenumber !== nothing push!(block.args, linenumber) end
+    push!(block.args, body)
+    
+    fnexpr = :(GetSetProp.assign(self::$T, value) = $block)
+    insert!(fnexpr.args[1].args, 2, argtypeexpr(structpropexpr(T, prop)))
+    fnexpr
+end
+
+structfieldexpr(T::Symbol, prop::QuoteNode) = Expr(:curly, :(GetSetProp.StructField), T, prop)
+structfieldexpr(T::Symbol, prop::Symbol)    = structfieldexpr(T, QuoteNode(prop))
+structpropexpr( T::Symbol, prop::QuoteNode) = Expr(:curly, :(GetSetProp.StructProp),  T, prop)
+structpropexpr( T::Symbol, prop::Symbol)    = structpropexpr(T, QuoteNode(prop))
+
+function argtypeexpr(type::Expr)
+    Expr(:(::), Expr(:curly, :Type, type))
 end
 
 end # module
