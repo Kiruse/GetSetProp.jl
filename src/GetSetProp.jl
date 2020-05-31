@@ -13,20 +13,28 @@ const GetterSetterBody = Tuple{Optional{LineNumberNode}, Expr}
 struct StructProp{S, F} end
 struct StructField{S, F} end
 
-assign(inst, field::Symbol, value) = assign(getfieldtype(typeof(inst), field), inst, field, value)
+assign(inst, field::Symbol, value) = assign(StructProp{typeof(inst), field}, inst, value)
 assign(T::Type{StructProp{ S, F}}, inst::S, value) where {S, F} = assign(StructField{S, F}, inst, value)
 assign(T::Type{StructField{S, F}}, inst::S, value) where {S, F} = assign(getfieldtype(T), inst, F, value)
-assign(T::Type, inst, field::Symbol, value)                                       = setfield!(inst, field, convert(T, value))
+assign(::Type{T},  inst, field::Symbol, value)     where {T}                      = setfield!(inst, field, convert(T, value))
 assign(::Type{T1}, inst, field::Symbol, value::T2) where {T1, T2<:T1}             = setfield!(inst, field, value)
 assign(::Type{T1}, inst, field::Symbol, value::T2) where {T1<:Number, T2<:Number} = setfield!(inst, field, T1(value))
 
-retrieve(inst, field::Symbol) = retrieve(StructField{typeof(inst), field}, inst)
+retrieve(inst, field::Symbol) = retrieve(StructProp{typeof(inst), field}, inst)
 retrieve(::Type{StructProp{ S, F}}, inst::S) where {S, F} = retrieve(StructField{S, F}, inst)
 retrieve(::Type{StructField{S, F}}, inst::S) where {S, F} = getfield(inst, F)
 
+getparambody(x) = x
+getparambody(unionall::UnionAll) = getparambody(unionall.body)
+
 getfieldtype(S::Type, F::Symbol) = getfieldtype(StructField{S, F})
 @generated function getfieldtype(::Type{StructField{S, F}}) where {S, F}
-    T = S.types[findfirst(field->field==F, fieldnames(S))]
+    @assert !isa(S, UnionAll) "Cannot reliably use getfieldtype with UnionAll"
+    
+    idx = findfirst(field->field==F, fieldnames(S))
+    @assert idx !== nothing "Field $F not found in type $S"
+    
+    T = S.types[idx]
     :($T)
 end
 
@@ -74,8 +82,8 @@ macro generate_properties(T, block)
         end
     end)
     
-    push!(result.args, :(Base.getproperty(self::$T, prop::Symbol) = GetSetProp.retrieve(GetSetProp.StructProp{$T, prop}, self)))
-    push!(result.args, :(Base.setproperty!(self::$T, prop::Symbol, value) = GetSetProp.assign(GetSetProp.StructProp{$T, prop}, self, value)))
+    push!(result.args, :(Base.getproperty(self::$T, prop::Symbol) = GetSetProp.retrieve(self, prop)))
+    push!(result.args, :(Base.setproperty!(self::$T, prop::Symbol, value) = GetSetProp.assign(self, prop, value)))
     
     esc(result)
 end
@@ -85,54 +93,59 @@ macro set(args...) end
 
 filterlinenumbers(exprs) = filter(expr->!isa(expr, LineNumberNode), exprs)
 
-replace_self(T::Symbol, expr) = expr
-function replace_self(T::Symbol, expr::Expr)
+replace_self(T, expr) = expr
+function replace_self(T::Union{Symbol, Expr}, expr::Expr)
+    @assert isa(T, Symbol) || T.head == :curly
     if expr.head == :(=)
         lhs, rhs = expr.args
         
         if isa(lhs, Expr) && lhs.head == :. && lhs.args[1] == :self
             prop = lhs.args[2]::QuoteNode
             expr = :(GetSetProp.assign(self, $rhs))
-            insert!(expr.args, 2, structfieldexpr(T, prop))
+            insert!(expr.args, 2, structfieldexpr(prop))
         end
     elseif expr.head == :.
         if expr.args[1] == :self
             prop = expr.args[2]::QuoteNode
             expr = :(GetSetProp.retrieve(self))
-            insert!(expr.args, 2, structfieldexpr(T, prop))
+            insert!(expr.args, 2, structfieldexpr(prop))
         end
     end
     expr.args = map(sub->replace_self(T, sub), expr.args)
     expr
 end
 
-function generate_getter(T::Symbol, prop::Symbol, linenumber::Optional{LineNumberNode}, body)
+function generate_getter(T, prop::Symbol, linenumber::Optional{LineNumberNode}, body)
     block = Expr(:block)
     if linenumber !== nothing push!(block.args, linenumber) end
     push!(block.args, body)
     
     fnexpr = :(GetSetProp.retrieve(self::$T) = $block)
-    insert!(fnexpr.args[1].args, 2, argtypeexpr(structpropexpr(T, prop)))
+    insert!(fnexpr.args[1].args, 2, argsubtypeexpr(structpropexpr(T, prop)))
     fnexpr
 end
 
-function generate_setter(T::Symbol, prop::Symbol, linenumber::Optional{LineNumberNode}, body)
+function generate_setter(T, prop::Symbol, linenumber::Optional{LineNumberNode}, body)
     block = Expr(:block)
     if linenumber !== nothing push!(block.args, linenumber) end
     push!(block.args, body)
     
     fnexpr = :(GetSetProp.assign(self::$T, value) = $block)
-    insert!(fnexpr.args[1].args, 2, argtypeexpr(structpropexpr(T, prop)))
+    insert!(fnexpr.args[1].args, 2, argsubtypeexpr(structpropexpr(T, prop)))
     fnexpr
 end
 
-structfieldexpr(T::Symbol, prop::QuoteNode) = Expr(:curly, :(GetSetProp.StructField), T, prop)
-structfieldexpr(T::Symbol, prop::Symbol)    = structfieldexpr(T, QuoteNode(prop))
-structpropexpr( T::Symbol, prop::QuoteNode) = Expr(:curly, :(GetSetProp.StructProp),  T, prop)
-structpropexpr( T::Symbol, prop::Symbol)    = structpropexpr(T, QuoteNode(prop))
+structpropexpr(T, prop::QuoteNode) = Expr(:curly, :(GetSetProp.StructProp), :(<:$T), prop)
+structpropexpr(T, prop::Symbol)    = structpropexpr(T, QuoteNode(prop))
+structfieldexpr(prop::QuoteNode) = Expr(:curly, :(GetSetProp.StructField), :(typeof(self)), prop)
+structfieldexpr(prop::Symbol)    = structfieldexpr(QuoteNode(prop))
 
 function argtypeexpr(type::Expr)
     Expr(:(::), Expr(:curly, :Type, type))
+end
+
+function argsubtypeexpr(type::Expr)
+    Expr(:(::), Expr(:curly, :Type, Expr(:<:, type)))
 end
 
 end # module
